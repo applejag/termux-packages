@@ -1,0 +1,36 @@
+--- a/third_party/wayland-proxy/wayland-proxy.cpp
++++ b/third_party/wayland-proxy/wayland-proxy.cpp
+@@ -678,6 +678,9 @@
+ 
+ void WaylandProxy::Run() {
+   while (!IsChildAppTerminated() && PollConnections() && ProcessConnections())
++#ifdef __TERMUX__
++      if (mThreadRequestCancel) break;
++#endif
+     ;
+ }
+ 
+@@ -686,7 +689,11 @@
+   if (mThreadRunning) {
+     Info("thread is still running, terminating.\n");
+     mThreadRunning = false;
++#ifndef __TERMUX__
+     pthread_cancel(mThread);
++#else
++    mThreadRequestCancel = true;
++#endif
+     pthread_join(mThread, nullptr);
+   }
+   if (mProxyServerSocket != -1) {
+--- a/third_party/wayland-proxy/wayland-proxy.h
++++ b/third_party/wayland-proxy/wayland-proxy.h
+@@ -58,6 +58,9 @@
+   int mProxyServerSocket = -1;
+   pid_t mApplicationPID = 0;
+   std::atomic<bool> mThreadRunning = false;
++#ifdef __TERMUX__
++  std::atomic<bool> mThreadRequestCancel = false;
++#endif
+   pthread_t mThread;
+ 
+   // sockaddr_un has hardcoded max len of sun_path
