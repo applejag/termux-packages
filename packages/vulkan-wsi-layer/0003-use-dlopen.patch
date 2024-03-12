@@ -1,0 +1,135 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 781e675..d7f4a74 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -197,8 +197,7 @@ if(BUILD_WSI_X11)
+       ${CMAKE_CURRENT_BINARY_DIR})
+ 
+    target_compile_options(wsi_x11 INTERFACE "-DBUILD_WSI_X11=1")
+-   target_compile_options(wsi_x11 PUBLIC "--target=linux-aarch64-android33")
+-   list(APPEND LINK_WSI_LIBS wsi_x11 xcb xcb-present xcb-xfixes xcb-shm android)
++   list(APPEND LINK_WSI_LIBS wsi_x11 xcb xcb-present xcb-xfixes xcb-shm)
+ else()
+    list(APPEND JSON_COMMANDS COMMAND sed -i '/VK_KHR_xcb_surface/d' ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_window_system_integration.json)
+ endif()
+diff --git a/wsi/x11/swapchain.cpp b/wsi/x11/swapchain.cpp
+index 20554a9..056e318 100644
+--- a/wsi/x11/swapchain.cpp
++++ b/wsi/x11/swapchain.cpp
+@@ -40,6 +40,7 @@
+ #include <vulkan/vulkan_android.h>
+ #include <android/hardware_buffer.h>
+ 
++#include <dlfcn.h>
+ #include <sys/socket.h>
+ #include <sys/mman.h>
+ #include <poll.h>
+@@ -52,6 +53,63 @@
+ #include "wsi/surface.hpp"
+ #include "wsi/swapchain_base.hpp"
+ 
++class AHBUtils {
++public:
++   int allocate(const AHardwareBuffer_Desc *desc, AHardwareBuffer **outBuffer) {
++      init();
++      return allocateFn(desc, outBuffer);
++   }
++   int lock(AHardwareBuffer *buffer, uint64_t usage, int32_t fence, const ARect *rect, void **outVirtualAddress) {
++      init();
++      return lockFn(buffer, usage, fence, rect, outVirtualAddress);
++   }
++   int unlock(const AHardwareBuffer *buffer, int32_t *fence) {
++      init();
++      return unlockFn(buffer, fence);
++   }
++   void release(AHardwareBuffer *buffer) {
++      init();
++      releaseFn(buffer);
++   }
++   int sendHandleToUnixSocket(const AHardwareBuffer *buffer, int socketFd) {
++      init();
++      return sendHandleToUnixSocketFn(buffer, socketFd);
++   }
++private:
++   using ahb_allocate_type = int (*)(const AHardwareBuffer_Desc *, AHardwareBuffer **);
++   using ahb_lock_type = int (*)(AHardwareBuffer *, uint64_t, int32_t, const ARect *, void **);
++   using ahb_unlock_type = int (*)(const AHardwareBuffer *, int32_t *);
++   using ahb_release_type  = void (*)(AHardwareBuffer *);
++   using ahb_sendHandleToUnixSocket_type  = int (*)(const AHardwareBuffer *, int);
++
++   ahb_allocate_type allocateFn = nullptr;
++   ahb_lock_type lockFn = nullptr;
++   ahb_unlock_type unlockFn = nullptr;
++   ahb_release_type releaseFn = nullptr;
++   ahb_sendHandleToUnixSocket_type sendHandleToUnixSocketFn = nullptr;
++
++   void *handle;
++
++   void init() {
++      if (handle != nullptr) return;
++      void *_handle = dlopen("libnativewindow.so", RTLD_NOW);
++      if (_handle == nullptr) {
++         __builtin_abort();
++      }
++      allocateFn = reinterpret_cast<decltype(allocateFn)>(dlsym(_handle, "AHardwareBuffer_allocate"));
++      lockFn = reinterpret_cast<decltype(lockFn)>(dlsym(_handle, "AHardwareBuffer_lock"));
++      unlockFn = reinterpret_cast<decltype(unlockFn)>(dlsym(_handle, "AHardwareBuffer_unlock"));
++      releaseFn = reinterpret_cast<decltype(releaseFn)>(dlsym(_handle, "AHardwareBuffer_release"));
++      sendHandleToUnixSocketFn = reinterpret_cast<decltype(sendHandleToUnixSocketFn)>(dlsym(_handle, "AHardwareBuffer_sendHandleToUnixSocket"));
++      if (!(allocateFn && lockFn && unlockFn && releaseFn && sendHandleToUnixSocketFn)) {
++         __builtin_abort();
++      }
++      handle = _handle;
++   }
++};
++
++AHBUtils _ahb;
++
+ namespace wsi
+ {
+ namespace x11
+@@ -81,7 +139,7 @@ int HB_TO_DMABUF_FD(AHardwareBuffer *hb)
+       {
+          std::thread sender{ [&]
+                              {
+-                                AHardwareBuffer_sendHandleToUnixSocket(hb, socks[1]);
++                                _ahb.sendHandleToUnixSocket(hb, socks[1]);
+                                 close(socks[1]);
+                              } };
+          struct msghdr msg
+@@ -267,7 +325,7 @@ VkResult swapchain::create_and_bind_swapchain_image(VkImageCreateInfo image_crea
+    desc.height = m_image_create_info.extent.height;
+    desc.usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
+                 AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
+-   if (AHardwareBuffer_allocate(&desc, &data->ahb) == 0)
++   if (_ahb.allocate(&desc, &data->ahb) == 0)
+    {
+       VkImportAndroidHardwareBufferInfoANDROID hb_info = {};
+       hb_info.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
+@@ -450,7 +508,7 @@ void swapchain::present_image(uint32_t pending_index)
+    }
+    else
+    {
+-      AHardwareBuffer_lock(image->ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, nullptr, (void **)&image->map);
++      _ahb.lock(image->ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, nullptr, (void **)&image->map);
+       int stride = image->layout.rowPitch;
+       int bytesPerPixel = 4;
+       int width = stride / bytesPerPixel;
+@@ -468,7 +526,7 @@ void swapchain::present_image(uint32_t pending_index)
+          );
+       }
+       int32_t fence = -1;
+-      AHardwareBuffer_unlock(image->ahb, &fence);
++      _ahb.unlock(image->ahb, &fence);
+       unpresent_image(pending_index);
+    }
+    xcb_flush(connection);
+@@ -500,7 +558,7 @@ void swapchain::destroy_image(wsi::swapchain_image &image)
+       }
+       if (data->ahb != nullptr)
+       {
+-         AHardwareBuffer_release(data->ahb);
++         _ahb.release(data->ahb);
+       }
+       if (has_shm)
+       {
