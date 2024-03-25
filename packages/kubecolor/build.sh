@@ -14,7 +14,7 @@ termux_step_pre_configure() {
 }
 
 termux_step_make() {
-	go build -o kubecolor -ldflags "-X main.Version=${TERMUX_PKG_VERSION}"
+	go build -o kubecolor -ldflags "-X main.Version=v${TERMUX_PKG_VERSION}"
 }
 
 termux_step_make_install() {
